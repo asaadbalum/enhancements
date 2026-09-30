@@ -7,6 +7,7 @@ repos:
 authors:
   - shaneutt
   - jland-redhat
+  - asaadbalum
 graduation_criteria:
   - How? section with requirements and design
 stakeholders:
@@ -100,7 +101,8 @@ estimation, what to do with unused tokens, etc.
   systems (e.g. llm-d `InferenceObjective`) to degrade
   gracefully as a client approaches its budget.
   (Related: #856 soft rate limiting, #549 quota
-  exhaustion failover.)
+  exhaustion failover, [ai#1241] over-quota
+  annotation.)
 - **[S2]** Batch workload awareness: separate quota
   rules or deferred accounting for batch/async API
   patterns so bulk jobs do not starve interactive
@@ -241,6 +243,9 @@ backstop, not the first line of defense.
   when actual usage by type is known
 - Graduated soft limit tiers with header injection
   before hard deny
+- Per-rule over-quota enforcement when a reservation
+  is denied: `hard` (429) or `soft` (forward and
+  annotate)
 - Separate accounting for batch vs. interactive
   workloads
 - Exact metering records independent of rate limit
@@ -286,20 +291,65 @@ has an `action` with a `type`:
 
 - `inject` -- continue the request and apply
   `headers` (soft / signal tier). This is [S1]
-  functionality; MVP implements the tier mechanism
-  and `deny` action. `inject` support ships when S1
-  is scheduled.
+  functionality.
 - `deny` -- hard-deny with 429.
 
+`inject` support is [S1]. A `deny` tier is a hard
+reject with 429.
+
 Omit any `deny` tier for header-only / signal-driven
-enforcement -- usage is still tracked (including
-overage) for observability. Modeling soft and hard
-outcomes as the same `action` field keeps the API
-surface tight and leaves room for later action types
-without a second parallel field. Rule-level
-`estimation` and optional weight overrides are shown
-below; token-type capture and default weights are
-filter-wide.
+enforcement while the request is still admitted.
+Usage on that path is still tracked, including
+overage, for observability. Tier `action` stays the
+only ladder. `inject` and `deny` are not copied into
+a second tier field. Rule-level `estimation` and
+optional weight overrides are shown below; token-type
+capture and default weights are filter-wide.
+
+**Over-quota enforcement:** when the admission
+algorithm denies the reservation because the budget
+is exhausted, the rule's `enforcement` chooses the
+outcome. Default is `hard`, so a rule that does not
+set the field keeps today's 429. This is not another
+tier. Tiers annotate a request whose reservation was
+admitted, as usage climbs toward capacity.
+`enforcement` runs only when the reservation is
+denied. Tracked in [ai#1241]. The modes are `hard`
+and `soft`.
+
+- `hard` -- reject with 429 and the token rate-limit
+  response headers. An `over_quota` block is not
+  valid on this mode.
+- `soft` -- forward the request and set the
+  `over_quota` annotation on it. `over_quota` is
+  required: at least one static header, or
+  `include_remaining`, or `include_used`. No
+  reservation is stored, so the request is not
+  reconciled and the ledger does not gain this
+  overage.
+
+On a denial, `include_remaining` is the denying
+budget's remaining balance and `include_used` is
+that budget's consumed total. A rule can carry more
+than one budget. When more than one denies the
+reservation, both headers report the last denying
+budget in config order. They are not summed across
+budgets. `include_remaining` is 0 only when that
+budget's remaining balance is empty. The header
+names default to `X-RateLimit-Remaining-Tokens` and
+`X-Token-Quota-Used`. Names in `over_quota.headers`
+are filter-authored too. Before forwarding, the
+filter strips the default names and every
+configured annotation name from the inbound request
+on every path, including an admitted request that
+sets no annotation. It sets the configured values
+only on the soft denial, so a caller cannot spoof
+them.
+
+A rule may set both tiers and `enforcement`. Tiers
+are evaluated only after a reservation is admitted.
+`soft` applies only to a denial, so it does not
+replace a `deny` tier on admitted traffic.
 
 ```yaml
 rules:
@@ -371,6 +421,23 @@ token_budgets:
             x-gateway-inference-fairness-id: "85"
 ```
 
+Denied reservation forwarded instead of a 429. Tiers
+above still apply only when the reservation is
+admitted. `hard` is the default, so the examples
+above omit `enforcement`.
+
+```yaml
+rules:
+  - name: team-alpha
+    # token_budgets omitted; see the rule above.
+    enforcement: soft
+    over_quota:
+      headers:
+        X-Token-Quota: exhausted
+      include_remaining: true
+      include_used: true
+```
+
 #### Request Lifecycle
 
 Each request passes through four phases:
@@ -379,9 +446,13 @@ Each request passes through four phases:
    an estimated cost using the configured strategy, and
    evaluate every `token_budget` on that rule. Inject
    headers from exceeded soft tiers; if any budget hits
-   a `deny` tier, reject with 429. Estimation at
-   admission can be optionally disabled in favor of
-   response-only accounting.
+   a `deny` tier, reject with 429. If the algorithm
+   denies the reservation, apply `enforcement`:
+   `hard` rejects with 429; `soft` forwards and does
+   not store a reservation, so
+   reconciliation and cleanup do not run for that
+   request. Estimation at admission can be optionally
+   disabled in favor of response-only accounting.
 
 2. **Inference** - The request is forwarded upstream.
    The provider performs inference and returns token
@@ -600,13 +671,21 @@ type (from the provider), weighted cost, and timestamp.
 These records are independent of rate limit counters
 and can be consumed by external billing systems.
 
+A soft-forwarded request stores no reservation, so
+reconciliation does not run and the quota ledger
+does not change. Metering still records that
+request from provider-reported usage on the
+response: rule name, model, exact token counts by
+type, weighted cost, and timestamp.
+
 #### Observability
 
 The system emits:
 
 - **Metrics**: tokens reserved, reconciled, and
-  refunded; budget remaining; requests admitted vs.
-  denied; soft limit tier activations; overage amounts
+  refunded; budget remaining; requests admitted,
+  denied, or soft-over-quota; soft
+  limit tier activations; overage amounts
 - **Tracing**: per-request spans with estimated cost,
   actual cost, matched rule, and admission decision
 - **Accounting logs**: structured records at a
@@ -751,3 +830,4 @@ configurations.
 [#155]: https://github.com/praxis-proxy/praxis/issues/155
 [#551]: https://github.com/praxis-proxy/praxis/issues/551
 [ai#126]: https://github.com/praxis-proxy/ai/issues/126
+[ai#1241]: https://github.com/praxis-proxy/ai/issues/1241
